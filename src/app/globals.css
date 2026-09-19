@@ -1,0 +1,40 @@
+@import "tailwindcss";
+
+/*
+ * Light theme only, and deliberately so: a control plane whose status colours
+ * mean something needs one palette that was actually checked, not two that
+ * were half-checked.
+ */
+:root {
+  color-scheme: light;
+  --bg: #f7f7f6;
+  --surface: #ffffff;
+  --ink: #1b1b19;
+  --ink-soft: #5f5e5a;
+  --ink-faint: #8a8984;
+  --line: #e4e3df;
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-ink: var(--ink);
+  --color-ink-soft: var(--ink-soft);
+  --color-ink-faint: var(--ink-faint);
+  --color-line: var(--line);
+  --font-sans:
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+}
+
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Tabular figures keep dashboard columns from jittering as counters change. */
+.nums {
+  font-variant-numeric: tabular-nums;
+}
