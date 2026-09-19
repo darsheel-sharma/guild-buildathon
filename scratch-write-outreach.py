@@ -1,17 +1,23 @@
-/**
- * Outreach strategy agent.
- *
- * Decides whether, when and on which channel a prospect should be contacted —
- * separate from the agent that writes the message. Keeping the two apart is
- * what makes the system read as one SDR rather than four channel bots: the
- * channel choice accounts for what has already been tried on every other
- * channel, and the copy is written afterwards knowing which step it is.
- */
-import { z } from "zod";
-import type { Campaign, Channel, OutreachPlan, Prospect, ResearchOutput } from "@/core/types";
-import { runAgent, type AgentContext, type AgentOutcome } from "./runtime";
+path = "src/agents/outreach.ts"
+s = open(path, encoding="utf-8").read()
 
-const schema = z.object({
+old_imports = '''import { z } from "zod";
+import type { Campaign, Channel, OutreachPlan, Prospect, ResearchOutput } from "@/core/types";
+import { runAgent, type AgentOutcome } from "./runtime";'''
+new_imports = '''import { z } from "zod";
+import type { Campaign, Channel, OutreachPlan, Prospect, ResearchOutput } from "@/core/types";
+import { runAgent, type AgentContext, type AgentOutcome } from "./runtime";'''
+assert old_imports in s
+s = s.replace(old_imports, new_imports)
+
+old_schema = '''const schema = z.object({
+  channel: z.enum(["email", "linkedin", "sms", "voice"]),
+  should_contact: z.boolean(),
+  rationale: z.string().max(400),
+  wait_days: z.number().min(0).max(30),
+  sequence_step: z.number().min(1).max(10),
+});'''
+new_schema = '''const schema = z.object({
   channel: z.enum(["email", "linkedin", "sms", "voice"]),
   should_contact: z.boolean(),
   rationale: z.string().max(400),
@@ -76,12 +82,12 @@ function makeOutreachNormalizer(opts: { enabled: Channel[]; lastChannel: Channel
     }
 
     if (freeText !== null) {
-      const actionMatch = freeText.match(/\b(CONTACT|WAIT|SKIP|ESCALATE)\b/i);
+      const actionMatch = freeText.match(/\\b(CONTACT|WAIT|SKIP|ESCALATE)\\b/i);
       if (!actionMatch) {
         throw new Error(`DronaHQ Outreach Strategy Agent returned unparseable text: ${freeText.slice(0, 200)}`);
       }
       const action = actionMatch[1].toUpperCase();
-      const channelMatch = freeText.match(/\b(email|linkedin|sms|voice)\b/i);
+      const channelMatch = freeText.match(/\\b(email|linkedin|sms|voice)\\b/i);
       const channel: Channel =
         channelMatch && VALID_CHANNELS.has(channelMatch[1].toLowerCase())
           ? (channelMatch[1].toLowerCase() as Channel)
@@ -151,110 +157,9 @@ function makeOutreachNormalizer(opts: { enabled: Channel[]; lastChannel: Channel
         : undefined,
     };
   };
-}
+}'''
+assert old_schema in s
+s = s.replace(old_schema, new_schema)
 
-/**
- * Channel ladder. Early steps stay low-friction; phone and voice are only
- * earned by a high fit score, because a cold call on a weak match is how a
- * brand gets burned.
- */
-function chooseChannel(
-  enabled: Channel[],
-  step: number,
-  score: number,
-  lastChannel: Channel | null,
-): Channel {
-  const ladder: Channel[] = ["email", "linkedin", "email", "voice", "sms"];
-  const preferred = ladder.slice(step - 1).concat(ladder);
-  for (const channel of preferred) {
-    if (!enabled.includes(channel)) continue;
-    if (channel === lastChannel && enabled.length > 1) continue;
-    if ((channel === "voice" || channel === "sms") && score < 0.75) continue;
-    return channel;
-  }
-  return enabled[0] ?? "email";
-}
-
-export async function planOutreach(
-  campaign: Campaign,
-  prospect: Prospect,
-  input: {
-    campaignProspectId: string;
-    touches: number;
-    lastChannel: Channel | null;
-    lastTouchAt: string | null;
-    icpScore: number;
-    research: ResearchOutput | null;
-  },
-): Promise<AgentOutcome<OutreachPlan>> {
-  const step = input.touches + 1;
-  const enabled = campaign.channels ?? ["email"];
-
-  return runAgent<OutreachPlan>({
-    campaignId: campaign.id,
-    campaignProspectId: input.campaignProspectId,
-    agent: "outreach",
-    tier: "fast",
-    retrievalQuery: `outreach sequence strategy channel cadence ${campaign.icp_name}`,
-    retrievalKinds: ["playbook"],
-    schema,
-    seed: `${campaign.id}:${prospect.id}:${step}`,
-    input: { step, enabled, score: input.icpScore },
-    // Named fields for the DronaHQ agent's {{variable.*}} bindings.
-    variables: (ctx: AgentContext) => ({
-      campaign_name: campaign.icp_name,
-      prompt_version: ctx.harness.prompt_version_id,
-      channel_config: {
-        email: enabled.includes("email"),
-        linkedin: enabled.includes("linkedin"),
-        sms: enabled.includes("sms"),
-        voice: enabled.includes("voice"),
-      },
-      outreach_policy: {
-        min_days_between_touches: campaign.min_days_between_touches,
-        max_touches: campaign.max_touches,
-        conflict_policy: campaign.conflict_policy,
-        daily_send_limit: campaign.daily_send_limit,
-      },
-      rep_context: campaign.owner,
-    }),
-    normalize: makeOutreachNormalizer({ enabled, lastChannel: input.lastChannel, step }),
-    buildPrompt: ({ knowledge }) => `Decide the next outreach action for this prospect.
-
-Campaign:         ${campaign.name}
-Enabled channels: ${enabled.join(", ")}
-Cadence policy:   at least ${campaign.min_days_between_touches} days between touches, at most ${campaign.max_touches} touches
-Sequence step:    ${step}
-ICP fit score:    ${input.icpScore}
-Last channel:     ${input.lastChannel ?? "none yet"}
-Last touch:       ${input.lastTouchAt ?? "never"}
-
-Playbook (retrieved):
-${knowledge}
-
-Prospect: ${prospect.full_name}, ${prospect.title} at ${prospect.company} (${prospect.geography})
-Research signals: ${input.research?.signals.join("; ") ?? "none"}
-
-Pick exactly one enabled channel. Do not repeat the channel used for the last
-touch unless it is the only one enabled. Reserve voice and SMS for fit scores
-above 0.75. If contacting now would be wrong, set should_contact false and say
-how many days to wait.`,
-    simulate: (rng) => {
-      const channel = chooseChannel(enabled, step, input.icpScore, input.lastChannel);
-      const shouldContact = step <= campaign.max_touches;
-      return {
-        channel,
-        should_contact: shouldContact,
-        rationale: shouldContact
-          ? `Step ${step} of the sequence on ${channel}; fit score ${input.icpScore} and last touch was ${input.lastChannel ?? "none"}.`
-          : `Sequence budget of ${campaign.max_touches} touches is spent with no reply; stopping.`,
-        wait_days: shouldContact ? 0 : campaign.min_days_between_touches + rng.int(0, 2),
-        sequence_step: step,
-      };
-    },
-    summarise: (out) =>
-      out.should_contact
-        ? `contact on ${out.channel} at step ${out.sequence_step}`
-        : `hold for ${out.wait_days}d`,
-  });
-}
+open(path, "w", encoding="utf-8").write(s)
+print("outreach.ts: schema + normalizer added")

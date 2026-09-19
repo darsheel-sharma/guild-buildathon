@@ -22,13 +22,19 @@ Because the URL is generated per trigger rather than following a documented path
 URL per agent:
 
 ```bash
-DRONAHQ_API_KEY=sk_...
 DRONAHQ_AGENT_QUALIFY_URL=https://<generated-webhook-url>
+DRONAHQ_AGENT_QUALIFY_KEY=<that trigger's own api-key>
 DRONAHQ_AGENT_PERSONALISE_URL=https://<generated-webhook-url>
-# ... one per agent you want to move
+DRONAHQ_AGENT_PERSONALISE_KEY=<that trigger's own api-key>
+# ... one URL + key pair per agent you want to move
 ```
 
-With both set for an agent, `runStructured` (`src/core/platform/llm.ts`) calls DronaHQ first. The
+Each DronaHQ agent has its own webhook trigger and its own api-key — there is no single
+workspace-wide key, so both are per-agent. (`DRONAHQ_API_KEY`, unset by default, is only a fallback
+for an agent whose own `_KEY` isn't set.)
+
+With a URL and a resolvable key for an agent, `runStructured` (`src/core/platform/llm.ts`) calls
+DronaHQ first. The
 precedence is:
 
 1. **DronaHQ** — if this agent has an API key and a webhook URL
@@ -44,7 +50,7 @@ dashboard's agent-runs table. A misconfigured trigger degrades visibly instead o
 
 ```http
 POST <your webhook URL>
-api-key: sk_...
+api-key: <that trigger's own api-key>
 Content-Type: application/json
 
 {
@@ -55,7 +61,24 @@ Content-Type: application/json
 }
 ```
 
-Two things to note:
+Some agents also send **named top-level fields** alongside these four, so the agent's own
+`{{variable.*}}` bindings pick up real per-campaign data instead of a static value. Whichever agent's
+integration passes a `variables` object gets those keys merged into the body at the top level (they
+sit next to `agent`/`campaign_id`/`system`/`message`, not nested under them). `qualify` currently
+sends:
+
+```json
+{
+  "campaign_name": "SaaS CTO",
+  "icp_criteria": { "geography": "...", "target_roles": ["..."], "company_criteria": { "...": "..." } },
+  "exclusion_criteria": ["..."],
+  "min_score_threshold": 0.7,
+  "prospect": { "full_name": "...", "title": "...", "company": "...", "industry": "...", "employee_count": 0, "geography": "..." },
+  "research": { "...": "..." }
+}
+```
+
+Three things to note:
 
 - **`system` is the resolved harness from this platform's prompt registry.** If you also write
   instructions inside the DronaHQ agent, you now have prompt text in two places and the version
@@ -102,6 +125,13 @@ Schemas are defined in `src/agents/*.ts`. Reproduced here as the contract to con
 }
 ```
 
+The `qualify` integration additionally runs a normalizer (`normalizeIcpFitmentOutput` in
+`src/agents/qualify.ts`) on whatever comes back, before validation. This lets the ICP Fitment Agent
+keep its own native output shape — a 0-100 `fit_score`, an uppercase `verdict`, a `criteria_breakdown`
+array, a separate `rejection_reason`/`reasoning` — instead of forcing the DronaHQ agent to match this
+table exactly. If your webhook trigger's response schema already matches the table above, the
+normalizer passes it through unchanged.
+
 **`outreach`**
 ```json
 {
@@ -121,6 +151,21 @@ Schemas are defined in `src/agents/*.ts`. Reproduced here as the contract to con
   "knowledge_used": ["string"]
 }
 ```
+
+The Personalisation / Email Agent built on DronaHQ answers with a richer, audited shape:
+`personalisation_basis`, `knowledge_sources` (mapped onto `knowledge_used`), `word_count`,
+`requires_review`, `unverified_claims`, `flags`, and an `error` field used when it declines to write
+(for example, a disabled channel). A normalizer (`normalizeDraftedMessage` in
+`src/agents/personalise.ts`) reconciles this before validation; the extra fields ride along as
+optional properties on `DraftedMessage` so nothing downstream has to change. An `error` response with
+no `body` is treated as a decline and thrown, so the run degrades visibly instead of sending an empty
+message.
+
+This agent's Variables panel declares only five fields — `campaign_name`, `prompt_version`,
+`sender_identity`, `channel_rules`, `product_positioning` — so prospect and research specifics reach
+it through the prompt text and retrieval rather than named variables. `channel_rules` carries the
+channel being drafted, whether it is enabled for the campaign, the full enabled-channel list, the
+length/style limit for that channel, and the sequence step.
 
 **`converse`**
 ```json

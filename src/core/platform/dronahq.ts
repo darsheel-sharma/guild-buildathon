@@ -25,6 +25,14 @@ export interface DronaHqCall {
   prompt: string;
   /** Campaign id, passed through so DronaHQ-side logs line up with ours. */
   campaignId: string;
+  /**
+   * Named top-level fields, merged into the webhook body alongside
+   * agent/campaign_id/system/message. DronaHQ's Variables mechanism lets a
+   * payload key override a variable of the same name for that execution, so
+   * this is how one shared agent definition stays campaign-isolated instead
+   * of relying on the free-text prompt alone.
+   */
+  variables?: Record<string, unknown>;
 }
 
 export interface DronaHqResult {
@@ -32,15 +40,25 @@ export interface DronaHqResult {
   latencyMs: number;
 }
 
-const envKeyFor = (agent: AgentKey) =>
-  `DRONAHQ_AGENT_${agent.toUpperCase().replace(/[^A-Z0-9]/g, "_")}_URL`;
+const agentEnvSlug = (agent: AgentKey) => agent.toUpperCase().replace(/[^A-Z0-9]/g, "_");
+const envKeyFor = (agent: AgentKey) => `DRONAHQ_AGENT_${agentEnvSlug(agent)}_URL`;
+const apiKeyEnvKeyFor = (agent: AgentKey) => `DRONAHQ_AGENT_${agentEnvSlug(agent)}_KEY`;
 
 export function webhookFor(agent: AgentKey): string | null {
   return process.env[envKeyFor(agent)] ?? null;
 }
 
+/**
+ * Each DronaHQ agent (and its webhook trigger) is issued its own API key, so
+ * the per-agent key is checked first. DRONAHQ_API_KEY is kept only as a
+ * fallback for a workspace that intentionally shares one key across agents.
+ */
+export function apiKeyFor(agent: AgentKey): string | null {
+  return process.env[apiKeyEnvKeyFor(agent)] ?? process.env.DRONAHQ_API_KEY ?? null;
+}
+
 export function isConfigured(agent: AgentKey): boolean {
-  return Boolean(process.env.DRONAHQ_API_KEY) && Boolean(webhookFor(agent));
+  return Boolean(apiKeyFor(agent)) && Boolean(webhookFor(agent));
 }
 
 /** Which agents are currently delegated to DronaHQ. Surfaced in the UI. */
@@ -55,7 +73,7 @@ export function configuredAgents(agents: readonly AgentKey[]): AgentKey[] {
  */
 export async function invoke(call: DronaHqCall): Promise<DronaHqResult> {
   const url = webhookFor(call.agent);
-  const apiKey = process.env.DRONAHQ_API_KEY;
+  const apiKey = apiKeyFor(call.agent);
   if (!url || !apiKey) throw new Error(`DronaHQ is not configured for the ${call.agent} agent`);
 
   const started = Date.now();
@@ -71,6 +89,7 @@ export async function invoke(call: DronaHqCall): Promise<DronaHqResult> {
         campaign_id: call.campaignId,
         system: call.system,
         message: call.prompt,
+        ...call.variables,
       }),
       signal: controller.signal,
     });

@@ -269,6 +269,11 @@ CREATE TABLE IF NOT EXISTS eval_runs (
 
 ALTER TABLE platform_control ADD COLUMN IF NOT EXISTS demo_seeded boolean NOT NULL DEFAULT false;
 
+-- Set when the Conversation Agent reads an automated bounce, so a bad
+-- address stops being retried silently forever.
+ALTER TABLE prospects ADD COLUMN IF NOT EXISTS email_invalid boolean NOT NULL DEFAULT false;
+ALTER TABLE prospects ADD COLUMN IF NOT EXISTS email_invalid_reason text;
+
 CREATE INDEX IF NOT EXISTS cp_campaign_stage    ON campaign_prospects (campaign_id, stage);
 CREATE INDEX IF NOT EXISTS cp_prospect          ON campaign_prospects (prospect_id);
 CREATE INDEX IF NOT EXISTS runs_campaign_time   ON agent_runs (campaign_id, created_at DESC);

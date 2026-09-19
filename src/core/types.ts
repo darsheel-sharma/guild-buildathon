@@ -126,20 +126,63 @@ export interface OutreachPlan {
   rationale: string;
   wait_days: number;
   sequence_step: number;
+  // Richer decision detail from the DronaHQ Outreach Strategy Agent, kept
+  // optional so nothing that reads the base five fields above has to change.
+  action?: "contact" | "wait" | "skip" | "escalate";
+  reason?: string;
+  human_approval_required?: boolean;
+  angle?: string;
+  priority?: "high" | "medium" | "low";
+  flags?: string[];
+  planned_sequence?: string[];
 }
 
 export interface DraftedMessage {
   subject: string;
   body: string;
   knowledge_used: string[];
+  personalisation_basis?: string;
+  word_count?: number;
+  requires_review?: boolean;
+  unverified_claims?: string[];
+  flags?: string[];
 }
 
 export interface ReplyReading {
   sentiment: "positive" | "neutral" | "negative";
-  intent: "meeting" | "info" | "objection" | "referral" | "not_interested" | "unsubscribe";
-  next_action: "book_meeting" | "send_info" | "handle_objection" | "follow_up" | "stop" | "escalate";
+  intent:
+    | "meeting"
+    | "info"
+    | "objection"
+    | "referral"
+    | "not_interested"
+    | "unsubscribe"
+    | "deferred"
+    | "complaint"
+    | "auto_reply"
+    | "bounce"
+    | "unclear";
+  next_action:
+    | "book_meeting"
+    | "send_info"
+    | "handle_objection"
+    | "follow_up"
+    | "stop"
+    | "escalate"
+    | "pause";
   reasoning: string;
   objection?: string;
+  /** Exact phrase from the reply that drove the classification. */
+  trigger_phrase?: string;
+  /** Instructions for the personalisation agent; set only when next_action is respond-like. */
+  response_brief?: string;
+  /** Set only when next_action is "pause" — how long to hold before retrying. */
+  resume_after_days?: number;
+  /** Anything actionable pulled from the reply: availability, a referred name, a timeline, a changed role. */
+  extracted?: string[];
+  confidence?: "high" | "medium" | "low";
+  human_review?: boolean;
+  flags?: string[];
 }
 
 /** Every agent action is stamped with the exact configuration that produced it. */

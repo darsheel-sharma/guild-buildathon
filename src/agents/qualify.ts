@@ -120,10 +120,142 @@ export function scoreFit(campaign: Campaign, prospect: Prospect): FitResult {
   };
 }
 
+/**
+ * How far below threshold still counts as "close enough to check by hand"
+ * rather than a clean reject. Mirrors the DronaHQ ICP Fitment Agent's own
+ * rule: below threshold is REJECTED, *except* within this band of it, which
+ * escalates to NEEDS_REVIEW instead. Expressed on the 0-1 score scale (the
+ * agent's instructions state it as "10 points" on its 0-100 fit_score).
+ */
+const NEAR_MISS_BAND = 0.1;
+
 export function verdictFor(fit: FitResult, threshold: number): QualifyOutput["verdict"] {
   if (fit.hardFail) return "rejected";
   if (fit.softFail) return "needs_review";
-  return fit.score >= threshold ? "qualified" : "needs_review";
+  if (fit.score >= threshold) return "qualified";
+  if (fit.score >= threshold - NEAR_MISS_BAND) return "needs_review";
+  return "rejected";
+}
+
+const VALID_VERDICTS = new Set(["qualified", "rejected", "needs_review"]);
+
+/**
+ * The agent's Structured Output isn't enforcing JSON yet, so the webhook's
+ * `response` field currently arrives as free text in a consistent shape:
+ *
+ *   "QUALIFIED, fit score 1.0
+ *
+ *   - Role: ... matches the target role criteria.
+ *   - Industry: ...
+ *
+ *   All criteria are satisfied ..."
+ *
+ * Parsed directly rather than waiting on the platform to enforce JSON, so the
+ * pipeline works with whatever the agent actually returns today.
+ */
+function parseIcpFitmentText(text: string): { score: number; verdict: string; reasons: string[] } | null {
+  const verdictMatch = text.match(/\b(QUALIFIED|REJECTED|NEEDS[_\s-]?REVIEW)\b/i);
+  if (!verdictMatch) return null;
+  const verdictRaw = verdictMatch[1].toLowerCase().replace(/[\s-]+/g, "_");
+  const verdict = VALID_VERDICTS.has(verdictRaw) ? verdictRaw : "needs_review";
+
+  const scoreMatch = text.match(/fit\s*score[^0-9]*([\d.]+)/i);
+  const numericScore = scoreMatch ? Number(scoreMatch[1]) : NaN;
+  const score = Number.isFinite(numericScore)
+    ? Math.max(0, Math.min(1, numericScore > 1 ? numericScore / 100 : numericScore))
+    : 0;
+
+  const reasons = [...text.matchAll(/^\s*[-*•]\s*(.+)$/gm)].map((m) => m[1].trim()).filter(Boolean);
+  if (!reasons.length) {
+    const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+    const summary = lines[lines.length - 1];
+    if (summary) reasons.push(summary);
+  }
+  if (!reasons.length) reasons.push("DronaHQ ICP Fitment Agent returned free text with no parseable reasoning");
+
+  return { score, verdict, reasons: reasons.slice(0, 5) };
+}
+
+/**
+ * The ICP Fitment Agent built on DronaHQ keeps its own field names and
+ * conventions (a 0-100 fit_score, an UPPERCASE verdict, a criteria_breakdown
+ * array, a separate rejection_reason/reasoning) rather than this codebase's
+ * QualifyOutput shape. Reconciling that here — instead of changing either
+ * side to match the other — lets the DronaHQ agent stay exactly as designed.
+ */
+export function normalizeIcpFitmentOutput(raw: unknown): unknown {
+  if (!raw || typeof raw !== "object") return raw;
+  const obj = raw as Record<string, unknown>;
+
+  // Already our shape (simulate()/direct-model paths, or a future DronaHQ
+  // update that matches us) — pass through untouched.
+  if (
+    typeof obj.score === "number" &&
+    typeof obj.verdict === "string" &&
+    VALID_VERDICTS.has(obj.verdict) &&
+    Array.isArray(obj.reasons)
+  ) {
+    return obj;
+  }
+
+  // Today's actual shape: the trigger's envelope with the agent's free-text
+  // answer inside `response`. Try parsing that before falling through to the
+  // structured-field path below (which stays here for when Structured Output
+  // gets enforced on the DronaHQ side).
+  if (typeof obj.response === "string" && obj.response.trim()) {
+    const parsed = parseIcpFitmentText(obj.response);
+    if (parsed) return parsed;
+  }
+
+  // A webhook trigger that runs asynchronously answers with an execution
+  // acknowledgment (thread_id/run_id/"started in background"), not a scored
+  // result. Treating that as "no reasons given" would silently manufacture a
+  // fake needs_review verdict on every call. Fail loudly instead, so this
+  // degrades to the next backend and gets recorded as degraded rather than a
+  // false dronahq success.
+  const hasAnyResultField =
+    "verdict" in obj || "fit_score" in obj || "criteria_breakdown" in obj ||
+    "reasoning" in obj || "rejection_reason" in obj;
+  if (!hasAnyResultField) {
+    throw new Error(
+      `DronaHQ ICP Fitment Agent did not return a scored result (got: ${JSON.stringify(obj).slice(0, 200)}) — ` +
+        `this usually means the webhook trigger is running asynchronously and only acknowledged the run.`,
+    );
+  }
+
+  const verdictRaw = String(obj.verdict ?? "").trim().toLowerCase().replace(/\s+/g, "_");
+  const verdict = VALID_VERDICTS.has(verdictRaw)
+    ? verdictRaw
+    : verdictRaw.includes("qualif") && !verdictRaw.includes("dis")
+      ? "qualified"
+      : verdictRaw.includes("reject") || verdictRaw.includes("disqualif")
+        ? "rejected"
+        : "needs_review";
+
+  const rawScore = obj.fit_score ?? obj.score;
+  const numericScore = typeof rawScore === "number" ? rawScore : Number(rawScore ?? NaN);
+  const score = Number.isFinite(numericScore)
+    ? Math.max(0, Math.min(1, numericScore > 1 ? numericScore / 100 : numericScore))
+    : 0;
+
+  const reasons: string[] = [];
+  if (Array.isArray(obj.criteria_breakdown)) {
+    for (const item of obj.criteria_breakdown) {
+      if (typeof item === "string" && item) reasons.push(item);
+      else if (item && typeof item === "object") {
+        const c = item as Record<string, unknown>;
+        const parts = [c.criterion, c.result ?? c.status, c.detail ?? c.note].filter(
+          (p) => typeof p === "string" && p,
+        );
+        if (parts.length) reasons.push(parts.join(": "));
+      }
+    }
+  }
+  if (typeof obj.rejection_reason === "string" && obj.rejection_reason) reasons.push(obj.rejection_reason);
+  if (!reasons.length && typeof obj.reasoning === "string" && obj.reasoning) reasons.push(obj.reasoning);
+  if (!reasons.length) reasons.push("DronaHQ ICP Fitment Agent did not return a reason breakdown");
+
+  return { score, verdict, reasons: reasons.slice(0, 5) };
 }
 
 export async function qualifyProspect(
@@ -144,6 +276,29 @@ export async function qualifyProspect(
     schema,
     seed: `${campaign.id}:${prospect.id}`,
     input: { prospect: prospect.email, threshold },
+    // Named fields for the DronaHQ ICP Fitment Agent's {{variable.*}} bindings,
+    // so the same agent definition scores each campaign against its own
+    // criteria instead of one shared/static value.
+    variables: {
+      campaign_name: campaign.icp_name,
+      icp_criteria: {
+        geography: campaign.geography,
+        target_roles: campaign.target_roles ?? [],
+        company_criteria: campaign.company_criteria ?? {},
+      },
+      exclusion_criteria: campaign.exclusion_criteria ?? [],
+      min_score_threshold: threshold,
+      prospect: {
+        full_name: prospect.full_name,
+        title: prospect.title,
+        company: prospect.company,
+        industry: prospect.industry,
+        employee_count: prospect.employee_count,
+        geography: prospect.geography,
+      },
+      research: research ?? null,
+    },
+    normalize: normalizeIcpFitmentOutput,
     buildPrompt: ({ knowledge }) => `Qualify this prospect against the campaign ICP.
 
 Campaign ICP: ${campaign.icp_name}

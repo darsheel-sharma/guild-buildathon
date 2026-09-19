@@ -63,6 +63,7 @@ interface WorkRow {
   last_touch_at: string | null;
   icp_score: string | number | null;
   research: ResearchOutput | null;
+  blocked_reason: string | null;
   prospect_id: string;
   email: string;
   full_name: string;
@@ -75,14 +76,15 @@ interface WorkRow {
   linkedin_url: string;
   phone: string;
   source: string;
+  email_invalid: boolean;
 }
 
 const PROSPECT_COLUMNS = `
   cp.id AS cp_id, cp.stage, cp.touches, cp.last_channel, cp.last_touch_at,
-  cp.icp_score, cp.research,
+  cp.icp_score, cp.research, cp.blocked_reason,
   p.id AS prospect_id, p.email, p.full_name, p.title, p.company,
   p.company_domain, p.industry, p.geography, p.employee_count,
-  p.linkedin_url, p.phone, p.source`;
+  p.linkedin_url, p.phone, p.source, p.email_invalid`;
 
 function toProspect(row: WorkRow): Prospect {
   return {
@@ -362,11 +364,42 @@ async function phaseReplies(campaign: Campaign, budget: number): Promise<{ steps
     }
 
     const prospect = toProspect(row);
+
+    // The Conversation Agent's instructions require reading the whole prior
+    // thread before classifying ("a reply that reads as a brush-off after
+    // one email reads differently after four") — a one-line touch count is
+    // not enough. Pull the actual prior messages (both directions) and
+    // format them as a transcript instead.
+    const { rows: priorMessages } = await db.query<{
+      direction: string;
+      channel: Channel;
+      subject: string;
+      body: string;
+      created_at: string;
+    }>(
+      `SELECT direction, channel, subject, body, created_at
+         FROM messages
+        WHERE campaign_prospect_id = $1 AND id != $2
+        ORDER BY created_at ASC
+        LIMIT 20`,
+      [row.cp_id, row.msg_id],
+    );
+    const threadTranscript = priorMessages.length
+      ? priorMessages
+          .map(
+            (m) =>
+              `[${m.direction}, ${m.channel}]${m.subject ? ` Subject: ${m.subject}` : ""}
+${m.body}`,
+          )
+          .join("\n---\n")
+      : "(no prior messages on this thread)";
+
     const reading = await readReply(campaign, prospect, {
       campaignProspectId: row.cp_id,
       channel: row.msg_channel,
       replyBody: row.msg_body,
       threadSummary: `${row.touches} outbound touches, last on ${row.last_channel ?? "email"}`,
+      threadTranscript,
     });
     cost += reading.costUsd;
 
@@ -425,6 +458,47 @@ async function phaseReplies(campaign: Campaign, budget: number): Promise<{ steps
         agent: "converse",
         prospect: prospect.full_name,
         action: `stop (${reading.output.intent})`,
+        detail: reading.output.reasoning,
+        status: "ok",
+        mode: reading.mode,
+      });
+      continue;
+    }
+
+    if (action === "pause") {
+      // DronaHQ's PAUSE (soft stop, e.g. "not a priority this quarter") and
+      // RESCHEDULE (auto-reply/bounce) both mean "don't reply now" — schedule
+      // a retry via next_action_at, the same field phaseOutreach already
+      // respects, rather than drafting anything immediately.
+      const resumeDays = reading.output.resume_after_days ?? 3;
+      await setStage(row.cp_id, row.stage === "discovered" ? "engaged" : row.stage, {
+        outcome: reading.output.intent,
+        next_action_at: new Date(Date.now() + resumeDays * 86_400_000).toISOString(),
+        blocked_reason: reading.output.reasoning,
+      });
+
+      // A bounce means the address itself is suspect, not just this touch —
+      // flag it on the prospect record so nothing keeps sending to it
+      // unattended, per the agent's edge case ("flag the address as
+      // possibly invalid").
+      if (reading.output.intent === "bounce") {
+        await db.query(
+          `UPDATE prospects SET email_invalid = true, email_invalid_reason = $2 WHERE id = $1`,
+          [prospect.id, reading.output.reasoning.slice(0, 300)],
+        );
+        await logEvent({
+          campaignId: campaign.id,
+          level: "warn",
+          type: "prospect.email_invalid",
+          message: `${prospect.full_name}: automated bounce, email flagged as possibly invalid`,
+          data: { email: prospect.email },
+        });
+      }
+
+      steps.push({
+        agent: "converse",
+        prospect: prospect.full_name,
+        action: `paused, retry in ${resumeDays}d`,
         detail: reading.output.reasoning,
         status: "ok",
         mode: reading.mode,
@@ -643,13 +717,68 @@ async function phaseOutreach(campaign: Campaign, budget: number): Promise<{ step
           WHERE campaign_prospect_id = $1 AND direction = 'inbound'`,
         [row.cp_id],
       );
+
+      // The Follow-up Agent's instructions require the real touch history
+      // (to avoid repeating an angle and to compute sequence_position) — a
+      // touch count alone isn't enough. Same fix as the Conversation Agent's
+      // thread transcript.
+      const { rows: priorTouches } = await db.query<{
+        direction: string;
+        channel: Channel;
+        subject: string;
+        body: string;
+        created_at: string;
+      }>(
+        `SELECT direction, channel, subject, body, created_at
+           FROM messages
+          WHERE campaign_prospect_id = $1
+          ORDER BY created_at ASC
+          LIMIT 20`,
+        [row.cp_id],
+      );
+      const touchHistory = priorTouches.length
+        ? priorTouches
+            .map(
+              (m, i) =>
+                `${i + 1}. [${m.direction}, ${m.channel}, ${m.created_at}]${m.subject ? ` Subject: ${m.subject}` : ""}
+${m.body.slice(0, 300)}`,
+            )
+            .join("\n---\n")
+        : "(no touch history)";
+
       const decision = await decideFollowup(campaign, prospect, {
         campaignProspectId: row.cp_id,
         touches: row.touches,
         daysSinceLastTouch: days,
         everReplied: (replied[0]?.n ?? 0) > 0,
+        touchHistory,
+        emailInvalid: row.email_invalid,
+        pausedReason: row.blocked_reason,
+        research: row.research,
       });
       cost += decision.costUsd;
+
+      if (decision.output.action === "escalate") {
+        // WRONG_AGENT (a reply slipped through to this agent) or ROLE_CHANGE —
+        // either way this isn't a routine cadence decision, hand it to a human
+        // the same way converse.ts does.
+        await createApproval({
+          campaignId: campaign.id,
+          cpId: row.cp_id,
+          kind: "handoff",
+          reason: decision.output.reasoning,
+          payload: { stop_reason: decision.output.stop_reason ?? null },
+        });
+        steps.push({
+          agent: "followup",
+          prospect: prospect.full_name,
+          action: "escalated to rep",
+          detail: decision.output.reasoning,
+          status: "ok",
+          mode: decision.mode,
+        });
+        continue;
+      }
 
       if (decision.output.action === "stop") {
         await setStage(row.cp_id, "stopped", {
@@ -659,7 +788,7 @@ async function phaseOutreach(campaign: Campaign, budget: number): Promise<{ step
         steps.push({
           agent: "followup",
           prospect: prospect.full_name,
-          action: "sequence stopped",
+          action: `sequence stopped${decision.output.stop_reason ? ` (${decision.output.stop_reason})` : ""}`,
           detail: decision.output.reasoning,
           status: "ok",
           mode: decision.mode,

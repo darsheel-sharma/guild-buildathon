@@ -36,6 +36,14 @@ export interface AgentInvocation<T> {
   seed: string;
   summarise: (output: T) => string;
   input: Record<string, unknown>;
+  /**
+   * Named fields forwarded to DronaHQ's Variables mechanism (see dronahq.ts).
+   * A function form is available for values only known once the harness is
+   * resolved (e.g. prompt_version_id).
+   */
+  variables?: Record<string, unknown> | ((ctx: AgentContext) => Record<string, unknown>);
+  /** Reshapes a DronaHQ agent's raw response before schema validation. */
+  normalize?: (raw: unknown) => unknown;
 }
 
 export interface AgentOutcome<T> {
@@ -76,6 +84,8 @@ export async function runAgent<T>(inv: AgentInvocation<T>): Promise<AgentOutcome
     // behaviour too — otherwise version control would look cosmetic offline.
     seed: `${inv.agent}:${inv.seed}:${harness.harness_hash}`,
     simulate: (rng) => inv.simulate(rng, ctx),
+    variables: typeof inv.variables === "function" ? inv.variables(ctx) : inv.variables,
+    normalize: inv.normalize,
   });
 
   const runId = crypto.randomUUID();

@@ -10,13 +10,101 @@
  */
 import { z } from "zod";
 import type { Campaign, Channel, DraftedMessage, Prospect, ResearchOutput } from "@/core/types";
-import { runAgent, type AgentOutcome } from "./runtime";
+import { runAgent, type AgentContext, type AgentOutcome } from "./runtime";
 
 const schema = z.object({
   subject: z.string().max(140),
   body: z.string().min(1).max(2000),
   knowledge_used: z.array(z.string()).max(6),
+  personalisation_basis: z.string().max(400).optional(),
+  word_count: z.number().optional(),
+  requires_review: z.boolean().optional(),
+  unverified_claims: z.array(z.string()).max(10).optional(),
+  flags: z.array(z.string()).max(10).optional(),
 });
+
+function toStringArray(value: unknown, max = 10): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((v): v is string => typeof v === "string" && v.length > 0).slice(0, max);
+}
+
+/**
+ * The Personalisation / Email Agent built on DronaHQ answers with a richer,
+ * audited shape (personalisation_basis, knowledge_sources, word_count,
+ * requires_review, unverified_claims, flags) than this codebase's
+ * DraftedMessage. The base three fields (subject/body/knowledge_used) are
+ * always derived so nothing existing has to change; the richer fields ride
+ * along on optional properties added to DraftedMessage.
+ *
+ * Edge case per the agent's instructions: a disabled channel returns an
+ * `error` field and no body. That is treated as a decline (thrown) rather
+ * than sent as an empty message, so the run degrades visibly to the next
+ * backend instead of silently posing as a successful draft.
+ */
+export function normalizeDraftedMessage(raw: unknown): unknown {
+  if (!raw || typeof raw !== "object") return raw;
+  let obj = raw as Record<string, unknown>;
+
+  // Already our shape (simulate()/direct-model paths) — pass through untouched.
+  if (typeof obj.subject === "string" && typeof obj.body === "string" && Array.isArray(obj.knowledge_used)) {
+    return obj;
+  }
+
+  // The trigger's envelope wraps the agent's answer in `response`, which may
+  // be the message JSON serialised as a string, or free text if Structured
+  // Output isn't enforcing the schema yet.
+  if (typeof obj.response === "string") {
+    const text = obj.response.trim();
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed && typeof parsed === "object") obj = parsed as Record<string, unknown>;
+      else throw new Error("not an object");
+    } catch {
+      // Free text with no reliable subject/body split. Keep it as the body
+      // rather than guessing at structure, and flag it for review.
+      if (!text) throw new Error("DronaHQ Personalisation Agent returned an empty response");
+      return {
+        subject: "",
+        body: text.slice(0, 2000),
+        knowledge_used: [],
+        requires_review: true,
+        flags: ["unstructured_response"],
+      };
+    }
+  }
+
+  const hasAnyMessageField =
+    "body" in obj ||
+    "subject" in obj ||
+    "error" in obj ||
+    "personalisation_basis" in obj ||
+    "unverified_claims" in obj;
+  if (!hasAnyMessageField) {
+    throw new Error(
+      `DronaHQ Personalisation Agent did not return a message (got: ${JSON.stringify(obj).slice(0, 200)})`,
+    );
+  }
+
+  if (typeof obj.error === "string" && obj.error.length > 0 && typeof obj.body !== "string") {
+    throw new Error(`DronaHQ Personalisation Agent declined: ${obj.error.slice(0, 200)}`);
+  }
+
+  const knowledgeSources = toStringArray(obj.knowledge_sources ?? obj.knowledge_used, 6);
+  const body = typeof obj.body === "string" ? obj.body : "";
+  const wordCount =
+    typeof obj.word_count === "number" ? obj.word_count : body.split(/\s+/).filter(Boolean).length;
+
+  return {
+    subject: typeof obj.subject === "string" ? obj.subject : "",
+    body,
+    knowledge_used: knowledgeSources,
+    personalisation_basis: typeof obj.personalisation_basis === "string" ? obj.personalisation_basis : undefined,
+    word_count: wordCount,
+    requires_review: typeof obj.requires_review === "boolean" ? obj.requires_review : undefined,
+    unverified_claims: toStringArray(obj.unverified_claims, 10),
+    flags: toStringArray(obj.flags, 10),
+  };
+}
 
 /**
  * Reads the tone the campaign prompt asks for. Crude keyword matching rather
@@ -82,6 +170,24 @@ export async function draftMessage(
       step: input.sequenceStep,
       objection: input.objection ?? null,
     },
+    // Named fields for the DronaHQ agent's {{variable.*}} bindings. This
+    // agent's Variables panel declares only these five — prospect/research
+    // specifics reach it through the prompt text (buildPrompt below) plus
+    // retrieval, not through named variables.
+    variables: (ctx: AgentContext) => ({
+      campaign_name: campaign.icp_name,
+      prompt_version: ctx.harness.prompt_version_id,
+      sender_identity: { name: input.senderName, title: input.senderTitle },
+      channel_rules: {
+        channel: input.channel,
+        enabled: campaign.channels.includes(input.channel),
+        enabled_channels: campaign.channels,
+        limit: LIMITS[input.channel],
+        sequence_step: input.sequenceStep,
+      },
+      product_positioning: campaign.objective,
+    }),
+    normalize: normalizeDraftedMessage,
     buildPrompt: ({ knowledge }) => `Write outreach step ${input.sequenceStep} for this prospect.
 
 Channel: ${input.channel} — ${LIMITS[input.channel]}

@@ -89,6 +89,16 @@ export interface StructuredCall<T> {
   /** Stable seed — usually campaign + prospect + agent + prompt version. */
   seed: string;
   maxOutputTokens?: number;
+  /** Named fields forwarded to DronaHQ's Variables mechanism (see dronahq.ts). */
+  variables?: Record<string, unknown>;
+  /**
+   * Reshapes a DronaHQ agent's raw response into this call's schema before
+   * validation. DronaHQ-side agents are free to use their own field names and
+   * conventions (e.g. a 0-100 score, an uppercase verdict) — this is the one
+   * place that difference gets reconciled, so the rest of the pipeline never
+   * has to know which backend answered.
+   */
+  normalize?: (raw: unknown) => unknown;
 }
 
 export interface StructuredResult<T> {
@@ -121,11 +131,14 @@ export async function runStructured<T>(call: StructuredCall<T>): Promise<Structu
         system: call.system,
         prompt: call.prompt,
         campaignId: call.campaignId,
+        variables: call.variables,
       });
       // The agent's response schema is configured in DronaHQ, so it is not
-      // guaranteed to match ours. Validating here means a misconfigured trigger
-      // degrades visibly instead of poisoning the pipeline with a bad shape.
-      const parsed = call.schema.safeParse(raw);
+      // guaranteed to match ours. Normalize first (if this agent needs it),
+      // then validate — a misconfigured trigger still degrades visibly
+      // instead of poisoning the pipeline with a bad shape.
+      const normalized = call.normalize ? call.normalize(raw) : raw;
+      const parsed = call.schema.safeParse(normalized);
       if (!parsed.success) {
         throw new Error(`response did not match the expected schema: ${parsed.error.message.slice(0, 200)}`);
       }
