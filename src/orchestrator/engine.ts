@@ -149,6 +149,8 @@ async function deliverTouch(
     channel: Channel;
     sequenceStep: number;
     objection?: string;
+    /** The hook the outreach agent chose for this step, passed to the writer. */
+    angle?: string;
     /** engaged prospects stay engaged; cold ones move to contacted */
     nextStage: string;
     /**
@@ -204,6 +206,12 @@ async function deliverTouch(
   let cost = 0;
   let mode: Mode = "simulated";
   let agent: AgentKey = "personalise";
+  // Set when the writer itself says a human should look before this goes out:
+  // the Personalisation Agent sets requires_review per its own instructions,
+  // and the DronaHQ normalizer sets it when it had to fall back to treating an
+  // unstructured response as the body. Either way the draft is not trusted.
+  let needsReview = false;
+  let reviewReason = "";
 
   if (opts.channel === "voice") {
     agent = "voice";
@@ -212,9 +220,37 @@ async function deliverTouch(
       research: row.research,
       senderName: identity.name,
     });
-    body = plan.output.opening;
+    // The agent plans the call; a human rep makes it. Conducting the call
+    // autonomously needs a telephony stack we do not run, and a researched
+    // brief handed to a person is the honest version of that capability.
+    // So the whole brief becomes the body — previously only the opening
+    // survived and the questions, objections and escalation rule were
+    // discarded — and the touch is always queued for the rep.
+    subject = `Call brief: ${prospect.full_name} at ${prospect.company}`;
+    body = [
+      plan.output.compliance_line ? `Disclosure: ${plan.output.compliance_line}` : null,
+      `Objective: ${plan.output.objective}`,
+      ``,
+      `Opening:`,
+      plan.output.opening,
+      ``,
+      `Qualifying questions:`,
+      ...plan.output.qualification_questions.map((q, i) => `  ${i + 1}. ${q}`),
+      plan.output.likely_objections.length ? `
+Likely objections:` : null,
+      ...plan.output.likely_objections.map((o) => `  - ${o}`),
+      ``,
+      `Hand to a human if: ${plan.output.escalate_if}`,
+      plan.output.voicemail_script ? `
+Voicemail (under 15s):
+${plan.output.voicemail_script}` : null,
+    ]
+      .filter((line): line is string => line !== null)
+      .join("\n");
     cost += plan.costUsd;
     mode = plan.mode;
+    needsReview = true;
+    reviewReason = "voice call brief — a human rep makes this call";
   } else {
     const draft = await draftMessage(campaign, prospect, {
       campaignProspectId: row.cp_id,
@@ -224,22 +260,38 @@ async function deliverTouch(
       senderName: identity.name,
       senderTitle: identity.title,
       objection: opts.objection,
+      angle: opts.angle,
     });
     subject = draft.output.subject;
     body = draft.output.body;
     cost += draft.costUsd;
     mode = draft.mode;
+    if (draft.output.requires_review) {
+      needsReview = true;
+      reviewReason = draft.output.flags?.length
+        ? `writer flagged the draft: ${draft.output.flags.join(", ")}`
+        : "writer flagged the draft for review";
+    }
+    if (draft.output.unverified_claims?.length) {
+      needsReview = true;
+      reviewReason = `unverified claims in the draft: ${draft.output.unverified_claims.join("; ")}`;
+    }
   }
 
   // Human-in-the-loop: an approval-required campaign queues the draft instead
-  // of sending it. Nothing is delivered until someone decides.
-  if (campaign.autonomy === "approval_required") {
+  // of sending it, and so does any draft the writer flagged. Nothing is
+  // delivered until someone decides. Without this second condition a
+  // DronaHQ response that could not be parsed into a real message would be
+  // sent to a prospect verbatim.
+  if (campaign.autonomy === "approval_required" || needsReview) {
     await createApproval({
       campaignId: campaign.id,
       cpId: row.cp_id,
       kind: "outbound_message",
-      reason: `${opts.channel} step ${opts.sequenceStep} awaiting approval`,
-      payload: { channel: opts.channel, subject, body },
+      reason: needsReview
+        ? `${opts.channel} step ${opts.sequenceStep} held for review — ${reviewReason}`
+        : `${opts.channel} step ${opts.sequenceStep} awaiting approval`,
+      payload: { channel: opts.channel, subject, body, requires_review: needsReview },
     });
     await setStage(row.cp_id, row.stage, { next_action: "awaiting_approval" });
     return {
@@ -248,7 +300,9 @@ async function deliverTouch(
         agent,
         prospect: prospect.full_name,
         action: "queued for approval",
-        detail: `${opts.channel} draft held: campaign runs in approval-required mode`,
+        detail: needsReview
+          ? `${opts.channel} draft held for review: ${reviewReason}`
+          : `${opts.channel} draft held: campaign runs in approval-required mode`,
         status: "skipped",
         mode,
       },
@@ -512,7 +566,14 @@ ${m.body}`,
         cpId: row.cp_id,
         kind: action === "book_meeting" ? "book_meeting" : "handoff",
         reason: reading.output.reasoning,
-        payload: { intent: reading.output.intent, reply: row.msg_body.slice(0, 500) },
+        payload: {
+          intent: reading.output.intent,
+          reply: row.msg_body.slice(0, 500),
+          // What the prospect actually offered: availability, a referred
+          // name, a stated timeline. The rep approving this needs it.
+          extracted: reading.output.extracted ?? [],
+          trigger_phrase: reading.output.trigger_phrase ?? null,
+        },
       });
       await setStage(row.cp_id, action === "book_meeting" ? "meeting" : "engaged", {
         outcome: reading.output.intent,
@@ -538,11 +599,46 @@ ${m.body}`,
 
     // handle_objection / send_info / follow_up all mean: reply on the same
     // channel, with the objection (if any) fed to the writer.
+    // The agent flags human_review when its own confidence is below high.
+    // Replying to a real prospect on a reading we do not trust is exactly
+    // the case for a human, so queue it rather than answering.
+    if (reading.output.human_review) {
+      await createApproval({
+        campaignId: campaign.id,
+        cpId: row.cp_id,
+        kind: "outbound_message",
+        reason: `reply needs review before answering: ${reading.output.reasoning}`,
+        payload: {
+          intent: reading.output.intent,
+          reply: row.msg_body.slice(0, 500),
+          response_brief: reading.output.response_brief ?? null,
+          confidence: reading.output.confidence ?? null,
+        },
+      });
+      await setStage(row.cp_id, "engaged", {
+        outcome: reading.output.intent,
+        next_action: "awaiting_approval",
+      });
+      steps.push({
+        agent: "converse",
+        prospect: prospect.full_name,
+        action: "held for review",
+        detail: reading.output.reasoning,
+        status: "skipped",
+        mode: reading.mode,
+      });
+      continue;
+    }
+
     await setStage(row.cp_id, "engaged", { outcome: reading.output.intent });
     const touch = await deliverTouch(campaign, { ...row, stage: "engaged" }, {
       channel: row.msg_channel,
       sequenceStep: row.touches + 1,
       objection: reading.output.objection,
+      // The conversation agent writes a brief for the writer: what to
+      // address, which document to draw on, what tone. It was being
+      // discarded, so every reply was drafted without it.
+      angle: reading.output.response_brief,
       nextStage: "engaged",
       guard: "reply",
     });
@@ -822,6 +918,38 @@ ${m.body.slice(0, 300)}`,
     });
     cost += plan.costUsd;
 
+    // ESCALATE is not the same as "wait". The strategy agent raises it when a
+    // human should look before anything else happens to this prospect, so it
+    // queues an approval rather than quietly parking the row for 30 days with
+    // nobody told.
+    if (plan.output.human_approval_required || plan.output.action === "escalate") {
+      await createApproval({
+        campaignId: campaign.id,
+        cpId: row.cp_id,
+        kind: "handoff",
+        reason: plan.output.rationale,
+        payload: {
+          reason_code: plan.output.reason ?? null,
+          channel: plan.output.channel,
+          sequence_step: plan.output.sequence_step,
+          flags: plan.output.flags ?? [],
+        },
+      });
+      await setStage(row.cp_id, row.stage, {
+        next_action: "human_handoff",
+        blocked_reason: plan.output.rationale,
+      });
+      steps.push({
+        agent: "outreach",
+        prospect: prospect.full_name,
+        action: "escalated to rep",
+        detail: plan.output.rationale,
+        status: "ok",
+        mode: plan.mode,
+      });
+      continue;
+    }
+
     if (!plan.output.should_contact) {
       await setStage(row.cp_id, row.stage, {
         next_action_at: new Date(Date.now() + plan.output.wait_days * 86_400_000).toISOString(),
@@ -830,7 +958,7 @@ ${m.body.slice(0, 300)}`,
       steps.push({
         agent: "outreach",
         prospect: prospect.full_name,
-        action: `hold ${plan.output.wait_days}d`,
+        action: `hold ${plan.output.wait_days}d${plan.output.reason ? ` (${plan.output.reason})` : ""}`,
         detail: plan.output.rationale,
         status: "skipped",
         mode: plan.mode,
@@ -863,6 +991,7 @@ ${m.body.slice(0, 300)}`,
     const touch = await deliverTouch(campaign, row, {
       channel: plan.output.channel,
       sequenceStep: plan.output.sequence_step,
+      angle: plan.output.angle,
       nextStage: "contacted",
       guard: "prechecked",
     });

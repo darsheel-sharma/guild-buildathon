@@ -78,17 +78,16 @@ export function normalizeResearchDossier(raw: unknown): unknown {
       if (parsed && typeof parsed === "object") obj = parsed as Record<string, unknown>;
       else throw new Error("not an object");
     } catch {
-      // Free text: no reliable structure to parse, so this is a low-confidence
-      // stand-in rather than a fabricated dossier.
-      return {
-        company_summary: text.slice(0, 400) || "no dossier text returned",
-        role_summary: "",
-        signals: [],
-        pain_hypotheses: [],
-        personalisation_hooks: [],
-        tech_stack: [],
-        confidence: 0.3,
-      };
+      // Free text with no parseable dossier in it. Returning an empty
+      // dossier here would be worse than failing: it validates, so the run
+      // records as a successful DronaHQ call, and every downstream agent
+      // then personalises against nothing while the dashboard says it
+      // worked. Throw instead, so this degrades to the model or simulated
+      // path — both of which produce a real dossier — and is recorded as
+      // degraded.
+      throw new Error(
+        `DronaHQ Lead Research Agent returned unstructured text, not a dossier: ${text.slice(0, 200)}`,
+      );
     }
   }
 
@@ -111,11 +110,19 @@ export function normalizeResearchDossier(raw: unknown): unknown {
     company_summary: summariseFields(obj.company) ?? "no verified company facts returned",
     role_summary: summariseFields(obj.person) ?? "no verified person facts returned",
     signals: toStringArray(obj.signals, 5),
-    // This agent deliberately stays factual — pain hypotheses are out of its
-    // scope, not something DronaHQ failed to return.
-    pain_hypotheses: [],
+    // The personalisation agent leads on a pain hypothesis, so dropping these
+    // silently cost every DronaHQ-researched prospect its sharpest hook.
+    pain_hypotheses: toStringArray(obj.pain_hypotheses, 4),
     personalisation_hooks: toStringArray(obj.talking_points, 4),
-    tech_stack: toStringArray(fieldValue((obj.company as Record<string, unknown> | undefined)?.tech_stack), 6),
+    // DronaHQ's schema builder cannot nest an array inside an object, so a
+    // top-level tech_stack is the shape that is actually buildable there;
+    // the nested form is still read for agents configured the other way.
+    tech_stack: toStringArray(
+      Array.isArray(obj.tech_stack)
+        ? obj.tech_stack
+        : fieldValue((obj.company as Record<string, unknown> | undefined)?.tech_stack),
+      6,
+    ),
     confidence,
   };
 }
@@ -177,10 +184,14 @@ Prospect
 What we sell (retrieved knowledge):
 ${knowledge}
 
-Build structured context. Every personalisation hook must be traceable to the
-prospect record or the retrieved knowledge above — if you cannot ground a claim,
-leave it out and lower your confidence. Do not invent funding rounds, named
-customers, or headcount figures.`,
+Build structured context. Every signal and personalisation hook must be
+traceable to the prospect record, the retrieved knowledge above, or a source you
+actually verified — if you cannot ground a claim, leave it out and lower your
+confidence. Do not invent funding rounds, named customers, or headcount figures.
+
+pain_hypotheses are the exception: they are explicitly inferences, not facts.
+State each as a hypothesis this company plausibly has given its size, industry
+and the signals you found, and keep them to problems this product addresses.`,
     simulate: (rng) => {
       const signals = [rng.pick(SIGNALS), rng.pick(SIGNALS)].filter(
         (v, i, a) => a.indexOf(v) === i,

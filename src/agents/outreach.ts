@@ -105,8 +105,18 @@ function makeOutreachNormalizer(opts: { enabled: Channel[]; lastChannel: Channel
       );
     }
 
+    // An unrecognised action used to fall through to WAIT, which looks
+    // identical to a deliberate hold: the prospect stalls and nothing is
+    // recorded as degraded. Fail instead, so a misconfigured agent is
+    // visible rather than quietly patient.
     const actionRaw = String(obj.action ?? "").toUpperCase();
-    const action = ["CONTACT", "WAIT", "SKIP", "ESCALATE"].includes(actionRaw) ? actionRaw : "WAIT";
+    if (!["CONTACT", "WAIT", "SKIP", "ESCALATE"].includes(actionRaw)) {
+      throw new Error(
+        `DronaHQ Outreach Strategy Agent returned an unrecognised action "${actionRaw}" ` +
+          `(expected CONTACT, WAIT, SKIP or ESCALATE)`,
+      );
+    }
+    const action = actionRaw;
 
     const channelRaw = typeof obj.channel === "string" ? obj.channel.toLowerCase() : null;
     const channel: Channel = channelRaw && VALID_CHANNELS.has(channelRaw) ? (channelRaw as Channel) : fallbackChannel;

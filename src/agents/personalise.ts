@@ -127,12 +127,27 @@ function registerOf(system: string): Register {
   return "direct";
 }
 
-const LIMITS: Record<Channel, string> = {
-  email: "90 to 130 words, a subject line under 60 characters, one specific ask",
-  linkedin: "under 60 words, no subject, conversational, no links",
-  sms: "under 160 characters total, no links, sign off with the sender first name",
-  voice: "a 30-second spoken opening: one sentence of context, one question",
-};
+/**
+ * Length limits by channel *and* sequence position, matching the campaign's
+ * voice-and-rules knowledge document. A flat per-channel limit contradicted
+ * that document at later touches — the agent was told 90-130 words while the
+ * retrieved rules said under 40 — so the two are reconciled here, with the
+ * knowledge base as the source of truth.
+ */
+function limitFor(channel: Channel, step: number): string {
+  switch (channel) {
+    case "email":
+      if (step <= 1) return "60 to 110 words, a lowercase subject line under 8 words, one specific ask";
+      if (step <= 3) return "40 to 70 words, a lowercase subject line under 8 words, one specific ask";
+      return "under 40 words, a lowercase subject line under 8 words, one specific ask";
+    case "linkedin":
+      return "under 90 words, no subject, conversational, no links";
+    case "sms":
+      return "under 160 characters total, no links, sign off with the sender first name";
+    case "voice":
+      return "a 30-second spoken opening: one sentence of context, one question";
+  }
+}
 
 export async function draftMessage(
   campaign: Campaign,
@@ -146,6 +161,12 @@ export async function draftMessage(
     senderTitle: string;
     /** Set when this message answers an objection raised in a reply. */
     objection?: string;
+    /**
+     * The hook the outreach agent picked for this step, chosen to differ from
+     * every angle already used in the sequence. Without it the writer re-picks
+     * a hook on its own and the no-repeat guarantee is lost.
+     */
+    angle?: string;
   },
 ): Promise<AgentOutcome<DraftedMessage>> {
   const hook = input.research?.personalisation_hooks?.[0] ?? "";
@@ -159,9 +180,12 @@ export async function draftMessage(
     retrievalQuery: input.objection
       ? `objection handling ${input.objection} ${campaign.icp_name}`
       : `example ${input.channel} message ${campaign.icp_name} ${prospect.industry} ${pain}`,
+    // "voice" carries the hard tone rules (banned phrases, length table). It
+    // was missing here, so the voice guide never reached the writer even
+    // though its own front matter marks it always_retrieve.
     retrievalKinds: input.objection
-      ? ["objection", "case_study"]
-      : ["example_message", "case_study", "product"],
+      ? ["objection", "case_study", "voice"]
+      : ["example_message", "case_study", "product", "voice"],
     retrievalLimit: 4,
     schema,
     seed: `${campaign.id}:${prospect.id}:${input.channel}:${input.sequenceStep}`,
@@ -182,21 +206,25 @@ export async function draftMessage(
         channel: input.channel,
         enabled: campaign.channels.includes(input.channel),
         enabled_channels: campaign.channels,
-        limit: LIMITS[input.channel],
+        limit: limitFor(input.channel, input.sequenceStep),
         sequence_step: input.sequenceStep,
       },
       product_positioning: campaign.objective,
+      angle: input.angle ?? null,
     }),
     normalize: normalizeDraftedMessage,
     buildPrompt: ({ knowledge }) => `Write outreach step ${input.sequenceStep} for this prospect.
 
-Channel: ${input.channel} — ${LIMITS[input.channel]}
+Channel: ${input.channel} — ${limitFor(input.channel, input.sequenceStep)}
 Campaign objective: ${campaign.objective}
 From: ${input.senderName}, ${input.senderTitle}
 
 Prospect
   ${prospect.full_name} — ${prospect.title} at ${prospect.company}
   ${prospect.industry}, ${prospect.geography}
+
+Angle chosen by the outreach agent for this step — lead on this:
+  ${input.angle || "(none supplied, pick the strongest unused dossier signal)"}
 
 Research
   hook:    ${hook || "(none)"}

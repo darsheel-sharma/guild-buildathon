@@ -8,7 +8,7 @@
  */
 import { z } from "zod";
 import type { Campaign, Prospect, ResearchOutput } from "@/core/types";
-import { runAgent, type AgentOutcome } from "./runtime";
+import { runAgent, type AgentContext, type AgentOutcome } from "./runtime";
 
 const schema = z.object({
   opening: z.string().max(600),
@@ -16,6 +16,8 @@ const schema = z.object({
   qualification_questions: z.array(z.string()).min(1).max(4),
   likely_objections: z.array(z.string()).max(3),
   escalate_if: z.string().max(200),
+  compliance_line: z.string().max(300).optional(),
+  voicemail_script: z.string().max(400).optional(),
 });
 
 export interface CallPlan {
@@ -24,6 +26,76 @@ export interface CallPlan {
   qualification_questions: string[];
   likely_objections: string[];
   escalate_if: string;
+  /** Disclosure the rep opens with. */
+  compliance_line?: string;
+  /** Under 15 seconds, for when the call goes to voicemail. */
+  voicemail_script?: string;
+}
+
+/**
+ * The disclosure the caller opens with. No campaign field carries this yet,
+ * so it is a fixed default, kept here rather than in the prompt so it is one
+ * edit away from becoming per-campaign.
+ */
+const DEFAULT_COMPLIANCE_LINE =
+  "Open by naming yourself and the company you are calling on behalf of, and say why you are calling, " +
+  "before anything else. If asked directly whether this is an automated call, answer plainly and honestly.";
+
+function toStringArray(value: unknown, max: number): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((v): v is string => typeof v === "string" && v.length > 0).slice(0, max);
+}
+
+/**
+ * The DronaHQ Voice SDR Agent runs here as an ordinary text agent: it plans
+ * the call, a human rep makes it. Conducting the call inside DronaHQ needs
+ * their Enterprise tier, and planning is the half that carries the reasoning
+ * anyway.
+ */
+export function normalizeCallPlan(raw: unknown): unknown {
+  if (!raw || typeof raw !== "object") return raw;
+  let obj = raw as Record<string, unknown>;
+
+  // Already our shape (simulate()/direct-model paths) — pass through.
+  if (typeof obj.opening === "string" && Array.isArray(obj.qualification_questions)) {
+    return obj;
+  }
+
+  if (typeof obj.response === "string") {
+    const text = obj.response.trim();
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed && typeof parsed === "object") obj = parsed as Record<string, unknown>;
+      else throw new Error("not an object");
+    } catch {
+      throw new Error(`DronaHQ Voice SDR Agent returned unstructured text, not a call plan: ${text.slice(0, 200)}`);
+    }
+  }
+
+  const hasAnyPlanField =
+    "opening" in obj || "objective" in obj || "qualification_questions" in obj || "escalate_if" in obj;
+  if (!hasAnyPlanField) {
+    throw new Error(
+      `DronaHQ Voice SDR Agent did not return a call plan (got: ${JSON.stringify(obj).slice(0, 200)})`,
+    );
+  }
+
+  const questions = toStringArray(obj.qualification_questions ?? obj.questions, 4);
+
+  return {
+    opening: typeof obj.opening === "string" ? obj.opening.slice(0, 600) : "",
+    objective: typeof obj.objective === "string" ? obj.objective.slice(0, 200) : "Qualify fit and book a follow-up.",
+    // The schema requires at least one question; a plan without any is not a
+    // usable brief, so fail rather than hand a rep an empty call.
+    qualification_questions: questions.length ? questions : [],
+    likely_objections: toStringArray(obj.likely_objections ?? obj.objections, 3),
+    escalate_if:
+      typeof obj.escalate_if === "string"
+        ? obj.escalate_if.slice(0, 200)
+        : "The prospect asks about pricing, contracts, security review or legal, or asks for a human.",
+    compliance_line: typeof obj.compliance_line === "string" ? obj.compliance_line.slice(0, 300) : undefined,
+    voicemail_script: typeof obj.voicemail_script === "string" ? obj.voicemail_script.slice(0, 400) : undefined,
+  };
 }
 
 export async function planCall(
@@ -44,10 +116,18 @@ export async function planCall(
     agent: "voice",
     tier: "strong",
     retrievalQuery: `voice call script qualification questions objection handling ${campaign.icp_name}`,
-    retrievalKinds: ["voice_script", "objection", "playbook"],
+    retrievalKinds: ["voice_script", "voice", "objection", "playbook"],
     schema,
     seed: `${campaign.id}:${prospect.id}:call`,
     input: { prospect: prospect.email },
+    // Named fields for the DronaHQ agent's {{variable.*}} bindings.
+    variables: (ctx: AgentContext) => ({
+      campaign_name: campaign.icp_name,
+      prompt_version: ctx.harness.prompt_version_id,
+      call_objective: campaign.objective,
+      compliance_line: DEFAULT_COMPLIANCE_LINE,
+    }),
+    normalize: normalizeCallPlan,
     buildPrompt: ({ knowledge }) => `Plan a cold qualification call.
 
 Campaign objective: ${campaign.objective}

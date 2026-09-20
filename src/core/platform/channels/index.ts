@@ -41,8 +41,67 @@ function ref(prefix: string, seed: string): string {
 
 // ── email ──────────────────────────────────────────────────────────────────
 
+/**
+ * Gmail access tokens expire after about an hour, which is fine for a local
+ * run and useless for a deployment somebody opens the next morning: every
+ * send would silently fall back to the simulated transport. So a refresh
+ * token is preferred when configured, exchanged for a fresh access token and
+ * cached in memory until shortly before it expires.
+ *
+ * GMAIL_ACCESS_TOKEN still works on its own for a quick local test.
+ */
+let cachedAccessToken: { token: string; expiresAt: number } | null = null;
+
+async function gmailAccessToken(): Promise<string | null> {
+  const clientId = process.env.GMAIL_CLIENT_ID;
+  const clientSecret = process.env.GMAIL_CLIENT_SECRET;
+  const refreshToken = process.env.GMAIL_REFRESH_TOKEN;
+
+  if (!clientId || !clientSecret || !refreshToken) {
+    // No refresh credentials: fall back to a manually minted access token.
+    return process.env.GMAIL_ACCESS_TOKEN ?? null;
+  }
+
+  // 60s of slack so a token cannot expire between this check and the send.
+  if (cachedAccessToken && cachedAccessToken.expiresAt > Date.now() + 60_000) {
+    return cachedAccessToken.token;
+  }
+
+  try {
+    const res = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id: clientId,
+        client_secret: clientSecret,
+        refresh_token: refreshToken,
+        grant_type: "refresh_token",
+      }),
+    });
+    if (!res.ok) {
+      cachedAccessToken = null;
+      return process.env.GMAIL_ACCESS_TOKEN ?? null;
+    }
+    const json = (await res.json()) as { access_token?: string; expires_in?: number };
+    if (!json.access_token) {
+      cachedAccessToken = null;
+      return process.env.GMAIL_ACCESS_TOKEN ?? null;
+    }
+    cachedAccessToken = {
+      token: json.access_token,
+      expiresAt: Date.now() + (json.expires_in ?? 3600) * 1000,
+    };
+    return cachedAccessToken.token;
+  } catch {
+    // A refresh failure must not take the campaign down: fall through to the
+    // manual token if there is one, otherwise the simulated transport.
+    cachedAccessToken = null;
+    return process.env.GMAIL_ACCESS_TOKEN ?? null;
+  }
+}
+
 async function sendEmail(req: SendRequest): Promise<SendResult> {
-  const token = process.env.GMAIL_ACCESS_TOKEN;
+  const token = await gmailAccessToken();
   if (!token) {
     return {
       status: "sent",
@@ -256,7 +315,13 @@ export async function send(req: SendRequest): Promise<SendResult> {
 export function channelTransports(): Record<Channel, "live" | "simulated"> {
   const twilio = Boolean(twilioCreds());
   return {
-    email: process.env.GMAIL_ACCESS_TOKEN ? "live" : "simulated",
+    // Either a manually minted access token or a full refresh-token setup
+    // counts as live — the UI must not report simulated while real mail sends.
+    email:
+      process.env.GMAIL_ACCESS_TOKEN ||
+      (process.env.GMAIL_CLIENT_ID && process.env.GMAIL_CLIENT_SECRET && process.env.GMAIL_REFRESH_TOKEN)
+        ? "live"
+        : "simulated",
     linkedin: process.env.LINKEDIN_SERVICE_URL ? "live" : "simulated",
     sms: twilio ? "live" : "simulated",
     voice: twilio && process.env.VOICE_AGENT_WEBHOOK_URL ? "live" : "simulated",
